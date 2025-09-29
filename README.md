@@ -3,7 +3,7 @@
 The output files (assembly and annotation of the genome) can be found in the article: "Life in Plastic: novel insights into insect-mediated polystyrene biodegradation through genome assembly and annotation of Stenotrophomonas indicatrix strain DAI2m/c" currently submitted to the journal Microbial Genomics.
 
 Note that script always performs the commands starting from the working folder (i.e. Analysis) and assumes a tree structure as follows:
-
+```
 Analysis																					
 	├── 0.Raw_reads																			
 	│   ├── Illumina																		
@@ -16,3 +16,4 @@ Analysis
 	├── 5.Stats																				
 	├── 6.Annotation																			
 	    └── PGAP	
+```
