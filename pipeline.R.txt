@@ -1,0 +1,534 @@
+# 1. Loading libraries
+library(dada2)
+library(ggplot2)
+library(phyloseq)
+library(scales)
+library(RColorBrewer)
+library(vegan)
+library(randomcoloR)
+library(phyloseq)
+library(readxl)
+library(dplyr)
+library(pairwiseAdonis)
+library(grid)
+
+# 2. Directories and parameters
+input_dir  <- "C:/path/to/Guts_metabarcoding/"
+output_dir <- "C:/path/to/Guts_metabarcoding/"
+silva_train_set <- "C:/path/to/SILVA/silva_nr99_v138.1_train_set.fa.gz"
+silva_species_assignment <- "C:/path/to/SILVA/silva_species_assignment_v138.1.fa.gz"
+primer_fw <- "AGRGTTTGATYNTGGCTCAG"
+primer_rv <- "TASGGHTACCTTGTTASGACTT"
+files_raw <- list.files(input_dir, pattern="\\.fq\\.gz$", full.names=TRUE)
+
+# 3. Containers for results
+all_genus_frequency_df <- data.frame()
+all_seqtab_nochim_list <- list()
+all_taxa_list <- list()
+sample_names_list <- list()
+
+# 4. Main processing loop (primer removal, filtering/trimming, dereplication, error learning, DADA inference, chimera removal, taxonomy assignment).
+for (file_raw in files_raw) {
+  base_name <- sub("\\.fq\\.gz$", "", basename(file_raw))
+  file_noprim <- paste0(output_dir, base_name, ".no_primers.gz")
+  file_filt <- paste0(output_dir, base_name, ".no_primers.filtered.gz")
+  prim2 <- removePrimers(file_raw, file_noprim, primer.fwd = primer_fw, primer.rev = dada2::rc(primer_rv), orient = TRUE)
+  track2 <- filterAndTrim(file_noprim, file_filt, minQ = 0, minLen = 1200, truncLen = 1450, maxN = 0, rm.phix = FALSE, maxEE = 10, truncQ = 0)
+  derep <- derepFastq(file_filt)
+  err <- learnErrors(file_filt, multithread = TRUE)
+  dada_seq <- dada(derep, err = err, multithread = TRUE)
+  seq_table <- makeSequenceTable(dada_seq)
+  seq_table_nochim <- removeBimeraDenovo(seq_table, method = "consensus", multithread = TRUE)
+  taxa <- assignTaxonomy(seq_table_nochim, refFasta = silva_train_set, multithread = TRUE)
+  taxa <- addSpecies(taxa, refFasta = silva_species_assignment, allowMultiple = TRUE)
+  all_seqtab_nochim_list[[base_name]] <- seq_table_nochim
+  all_taxa_list[[base_name]] <- taxa
+  sample_names_list <- c(sample_names_list, base_name)
+  genus_column <- taxa[, "Genus"]
+  genus_frequency <- table(genus_column)
+  genus_frequency_df <- as.data.frame(genus_frequency)
+  colnames(genus_frequency_df) <- c("Genus", "Frequency")
+  total_entries <- sum(genus_frequency_df$Frequency)
+  genus_frequency_df$Percentage <- (genus_frequency_df$Frequency / total_entries) * 100
+  genus_frequency_df$Sample <- base_name
+  all_genus_frequency_df <- rbind(all_genus_frequency_df, genus_frequency_df)
+  write.csv(genus_frequency_df, file = paste0(output_dir, base_name, "_genus_frequency.csv"), row.names = FALSE)
+}
+
+# 5. Genus frequency export & plot: results and visualization
+combined_file <- paste0(output_dir, "combined_genus_frequency.csv")
+write.csv(all_genus_frequency_df, file = combined_file, row.names = FALSE)
+cat("Processing complete. Combined genus frequency data saved to:", combined_file, "\n")
+
+manual_order <- c("FGACT","FGBCT","FGCCT","FGDCT","FGECT","MGACT","MGBCT","MGCCT","MGDCT","MGECT",
+                  "HGACT","HGBCT","HGCCT","HGDCT","HGECT","FGAPS","FGBPS","FGCPS","FGDPS","FGEPS",
+                  "MGAPS","MGBPS","MGCPS","MGDPS","MGEPS","HGAPS","HGBPS","HGCPS","HGDPS","HGEPS")
+
+if (!all(manual_order %in% unique(all_genus_frequency_df$Sample))) {
+  stop("Some samples in the manual order are not present in the data frame.")
+}
+
+all_genus_frequency_df$Sample <- factor(all_genus_frequency_df$Sample, levels = manual_order)
+set.seed(42) 
+distinct_colors <- distinctColorPalette(length(unique(all_genus_frequency_df$Genus)))
+distinct_colors <- sample(distinct_colors)
+
+genus_plot <- ggplot(all_genus_frequency_df, aes(x = Sample, y = Percentage, fill = Genus)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Genus Distribution Across Samples", x = "Sample", y = "Percentage") +
+  scale_fill_manual(values = distinct_colors) +
+  theme(legend.position = "right")
+
+output_file <- paste0(output_dir, "genus_distribution_plot.pdf")
+ggsave(output_file, plot = genus_plot, width = 30, height = 8, dpi = 300)
+cat("Plot saved to:", output_file, "\n")
+
+# 6. Combined taxa list (CSV): Taxonomy tables export
+csv_output_dir <- "C:/path/to/Guts_metabarcoding/"
+combined_file <- paste0(csv_output_dir, "combined_taxa_list_ordinate.csv")
+combined_taxa_df <- data.frame()
+
+for (sample_name in names(all_taxa_list)) {
+  taxa_df <- as.data.frame(all_taxa_list[[sample_name]])
+  if (!"Sequence" %in% names(taxa_df)) {
+    taxa_df$Sequence <- rownames(taxa_df)
+  }
+  columns <- c("Sequence", setdiff(names(taxa_df), "Sequence"))
+  taxa_df <- taxa_df[, columns]
+  combined_taxa_df <- rbind(combined_taxa_df, taxa_df)
+}
+
+write.csv(combined_taxa_df, file = combined_file, row.names = FALSE)
+cat("Saved combined taxa list to:", combined_file, "\n")
+
+# 7. Per-sample seq tables (seqtab/): Per-sample tables for phyloseq
+for (sample_name in names(all_seqtab_nochim_list)) {
+  seq_table <- all_seqtab_nochim_list[[sample_name]]
+
+  cat("Sample:", sample_name, "\n")
+
+  if (nrow(seq_table) == 1) {
+    seq_table <- t(seq_table)
+  }
+
+  cat("Number of rows after possible transpose:", nrow(seq_table), "\n")
+  cat("Number of columns after possible transpose:", ncol(seq_table), "\n")
+
+  sequences <- rownames(seq_table)
+  values <- as.numeric(seq_table[, 1])
+
+  cat("Length of sequences:", length(sequences), "\n")
+  cat("Length of values:", length(values), "\n")
+
+  if (length(sequences) == length(values)) {
+    df <- data.frame(Sequence = sequences, Value = values, stringsAsFactors = FALSE)
+    df_filtered <- df[nchar(df$Sequence) == 1450, ]
+    output_file <- paste0(csv_output_dir, sample_name, "_seq_table_ordinated.csv")
+    write.csv(df_filtered, file = output_file, row.names = FALSE)
+    cat("Saved:", output_file, "\n")
+  } else {
+    cat("Mismatch in lengths of sequences and values for sample:", sample_name, "\n")
+  }
+}
+
+# 8. Merge in combined_sequences.csv: OTU-like combined table
+file_dir <. "C:/path/to/Guts_metabarcoding/seqtab"
+csv_files <- list.files(file_dir, pattern = "\\.csv$", full.names = TRUE)
+
+load_csv <- function(file) {
+  sample_name <- gsub("\\.csv$", "", basename(file))
+  data <- read.csv(file, header = TRUE, stringsAsFactors = FALSE)
+  colnames(data) <- c("Sequence", sample_name)
+  return(data)
+}
+
+combined_data <- load_csv(csv_files[1])
+
+for (i in 2:length(csv_files)) {
+  temp_data <- load_csv(csv_files[i])
+  combined_data <- full_join(combined_data, temp_data, by = "Sequence")
+}
+
+combined_data[is.na(combined_data)] <- 0
+output_file <- "C:/path/to/Guts_metabarcoding/combined_sequences.csv"
+write.csv(combined_data, file = output_file, row.names = FALSE)
+cat("Unione completata. Il file combinato è stato salvato in:", output_file, "\n")
+
+# ------------------------------------------------------------
+# Optional utility — Manual taxonomy curation (NA resolution)
+# Purpose:
+#   Resolve missing genus annotations by joining rows with Genus = NA
+#   against an external mapping (Sequence_ID -> Genus), then coalesce.
+# Inputs:
+#   - only_NA.csv : rows where Genus is NA, exported by the "combined_taxa_list_ordinate.csv" file
+#   - Gut_out.bn  : tab-delimited mapping "Sequence_ID <tab> Genus"
+# Output:
+#   - merged_data.csv : taxonomy with NA genera resolved where possible
+# Notes:
+#   - This step documents what was actually done; it is not part of
+#     the core protocol/pipeline.
+# ------------------------------------------------------------
+only_NA <- read.csv("C:/path/to/only_NA.csv", stringsAsFactors = FALSE, sep = ";")
+colnames(only_NA)
+gut_out <- read.delim("C:/path/to/Gut_out.bn", header = FALSE, sep = "\t", stringsAsFactors = FALSE)
+colnames(gut_out) <- c("Sequence_ID", "Genus")
+
+merged_data <- merge(only_NA, gut_out, by.x = "seq_ID", by.y = "Sequence_ID", all.x = TRUE)
+colnames(merged_data)
+
+colnames(merged_data)[colnames(merged_data) == "Genus.x"] <- "x"
+colnames(merged_data)[colnames(merged_data) == "Genus.y"] <- "y"
+
+merged_data$x[is.na(merged_data$x)] <- ""
+merged_data$Genus <- paste0(merged_data$x, merged_data$y)
+
+colnames(merged_data)
+merged_data <- merged_data[c(1:7, 11, 8:10)]
+colnames(merged_data)
+merged_data <- merged_data[, -c(9, 11)]
+
+file_path <- "C:/path/to/merged_data.csv"
+write.csv(merged_data, file = file_path, row.names = FALSE)
+cat("File saved in:", file_path, "\n")
+
+# ------------------------------------------------------------
+# Note:
+#   The file 'merged_data.csv' contains taxa where missing genera (NA) 
+#   have been reassigned using the external mapping.
+#   To obtain a complete taxonomy table, replace the NA rows in
+#   'combined_taxa_list_ordinate.csv' with the corresponding rows from
+#   'merged_data.csv'. 
+#   The resulting curated file is usually saved as 
+#   'combined_taxa_list_updated.csv' and can be used in downstream 
+#   analyses (e.g., phyloseq import).
+# ------------------------------------------------------------
+
+# 9. Phyloseq import: ASV, Taxa, Sample Metadata
+otu_file_path <- "C:/path/to/Guts_metabarcoding/combined_sequences.csv"
+otu_table_raw <- read.csv(otu_file_path, sep = ";", header = TRUE, stringsAsFactors = FALSE)
+head(otu_table_raw)
+rownames(otu_table_raw) <- otu_table_raw$Sequence
+otu_table_raw$Sequence <- NULL 
+otu_table_matrix <- as.matrix(otu_table_raw)
+otu_table_phyloseq <- otu_table(otu_table_matrix, taxa_are_rows = TRUE)
+
+tax_file_path <- "C:/path/to/Guts_metabarcoding/combined_taxa_list_updated.csv"
+tax_table_raw <- read.csv(tax_file_path, sep = ";", header = TRUE, stringsAsFactors = FALSE)
+head(tax_table_raw)
+tax_table_raw <- tax_table_raw[!duplicated(tax_table_raw$Sequence), ]
+rownames(tax_table_raw) <- tax_table_raw$Sequence
+tax_table_raw$Sequence <- NULL  
+tax_table_matrix <- as.matrix(tax_table_raw)
+tax_table_phyloseq <- tax_table(tax_table_matrix)
+phyloseq_obj <- phyloseq(otu_table_phyloseq, tax_table_phyloseq)
+
+csv_file_path <- "C:/path/to/Guts_metabarcoding/Sample_metadata.csv"
+sample_metadata_df <- read.csv2(csv_file_path, header = TRUE, stringsAsFactors = FALSE)
+rownames(sample_metadata_df) <- sample_metadata_df$SampleID
+sample_metadata_df <- sample_metadata_df[ , !names(sample_metadata_df) %in% c("SampleID")]
+sample_data_phyloseq <- sample_data(sample_metadata_df)
+
+phyloseq_obj <- phyloseq(otu_table_phyloseq, tax_table_phyloseq, sample_data_phyloseq)
+
+# 10. Statistical analyses: alpha diversity
+out_dir_res <- "C:/path/to/Guts_metabarcoding"
+sample_data(phyloseq_obj)$Group <- paste(sample_data(phyloseq_obj)$IntestinalSection, sample_data(phyloseq_obj)$Condition, sep = "_")
+head(sample_data(phyloseq_obj))
+View(sample_data(phyloseq_obj))
+
+#shannon
+out_file_path <- file.path(out_dir_res, "alpha_diversity_shannon.csv")
+alpha_diversity <- estimate_richness(phyloseq_obj, measures = "Shannon")
+write.csv(alpha_diversity, file = out_file_path, row.names = T)
+alpha_diversity$Group <- sample_data(phyloseq_obj)$Group
+kruskal_result <- kruskal.test(Shannon ~ Group, data = alpha_diversity)
+
+#simpson
+alpha_diversity_simpson <- estimate_richness(phyloseq_obj, measures = "Simpson")
+out_file_path <- file.path(out_dir_res, "alpha_diversity_simpson.csv")
+write.csv(alpha_diversity_simpson, file = out_file_path, row.names = T)
+alpha_diversity_simpson$Group <- sample_data(phyloseq_obj)$Group
+kruskal_result_simpson <- kruskal.test(Simpson ~ Group, data = alpha_diversity_simpson)
+print(kruskal_result_simpson)
+
+# 11. Statistical analyses: beta diversity
+out_dir_res <- "C:/path/to/Guts_metabarcoding"
+
+# Bray-Curtis
+otu_table_matrix <- as(otu_table(phyloseq_obj), "matrix")
+head(otu_table_matrix)
+bray_curtis_dist <- phyloseq::distance(phyloseq_obj, method = "bray")
+as.matrix(bray_curtis_dist)[1:5, 1:5]
+
+# PERMANOVA
+metadata_df <- as.data.frame(sample_data(phyloseq_obj))
+
+# Pairwise PERMANOVA by Condition
+result_condition <- pairwise.adonis(bray_curtis_dist, factors = metadata_df$Condition, perm = 999, p.adjust.m = "BH")
+result_condition_df <- as.data.frame(result_condition)
+out_file_path_condition <- file.path(out_dir_res, "PERMANOVA_Condition_results.csv")
+write.csv(result_condition_df, file = out_file_path_condition, row.names = TRUE)
+
+#Pairwise PERMANOVA by IntestinalSection
+result_intestinal_section <- pairwise.adonis(bray_curtis_dist, factors = metadata_df$IntestinalSection, perm = 999, p.adjust.m = "BH")
+result_intestinal_section_df <- as.data.frame(result_intestinal_section)
+out_file_path_intestinal <- file.path(out_dir_res, "PERMANOVA_IntestinalSection_results.csv")
+write.csv(result_intestinal_section_df, file = out_file_path_intestinal, row.names = TRUE)
+
+# Pairwise PERMANOVA by Condition_IntestinalSection
+metadata_df$Condition_IntestinalSection <- interaction(metadata_df$Condition, metadata_df$IntestinalSection)
+result_combined <- pairwise.adonis(bray_curtis_dist, factors = metadata_df$Condition_IntestinalSection, perm = 999, p.adjust.m = "BH")
+result_combined_df <- as.data.frame(result_combined)
+out_file_path_combined <- file.path(out_dir_res, "PERMANOVA_Condition_IntestinalSection_results.csv")
+write.csv(result_combined_df, file = out_file_path_combined, row.names = TRUE)
+
+# PCoA ordination colored by Condition (CT vs PS)
+pcoa_result <- cmdscale(bray_curtis_dist, eig = TRUE, k = 2)
+pcoa_df <- data.frame(
+  Axis1 = pcoa_result$points[, 1],
+  Axis2 = pcoa_result$points[, 2],
+  Condition = metadata_df$Condition
+)
+
+pcoa_ct_ps_df <- subset(pcoa_df, Condition %in% c("CT", "PS"))
+pcoa_ct_ps_plot <- ggplot(pcoa_ct_ps_df, aes(x = Axis1, y = Axis2, color = Condition)) +
+  geom_point(size = 4) +
+  labs(title = "PCoA - Condition: CT vs PS", x = "PCoA Axis 1", y = "PCoA Axis 2") +
+  theme_light() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor = element_line(color = "gray90")
+  ) +
+  scale_color_manual(values = c("CT" = "blue", "PS" = "red"))
+
+out_dir <- "C:/path/to/Guts_metabarcoding"
+ggsave(file.path(out_dir, "PCoA_CT_PS.png"), plot = pcoa_ct_ps_plot, width = 12, height = 8, dpi = 300)
+
+# PCoA ordination colored by Intestinal_section (FG, MG, HG)
+pcoa_df$IntestinalSection <- metadata_df$IntestinalSection
+pcoa_result <- cmdscale(bray_curtis_dist, eig = TRUE, k = 2)
+pcoa_df <- data.frame(
+  Axis1 = pcoa_result$points[, 1],
+  Axis2 = pcoa_result$points[, 2],
+  Condition = metadata_df$Condition,
+  IntestinalSection = metadata_df$IntestinalSection
+)
+
+pcoa_fm_hg_df <- subset(pcoa_df, IntestinalSection %in% c("FG", "MG", "HG"))
+pcoa_fm_hg_plot <- ggplot(pcoa_fm_hg_df, aes(x = Axis1, y = Axis2, color = IntestinalSection)) +
+  geom_point(size = 4) +
+  labs(title = "PCoA - Intestinal Sections: FG, MG, HG", x = "PCoA Axis 1", y = "PCoA Axis 2") +
+  theme_light() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor = element_line(color = "gray90")
+  ) +
+  scale_color_manual(values = c("FG" = "blue", "MG" = "green", "HG" = "red"))
+ggsave("PCoA_ForeGut_MidGut_HindGut.png", plot = pcoa_fm_hg_plot, width = 12, height = 8, dpi = 300)
+
+# PCoA ordination colored by Condition_IntestinalSection
+pcoa_ct_ps_df <- subset(pcoa_df, IntestinalSection %in% c("FG", "MG", "HG") & Condition %in% c("CT", "PS"))
+pcoa_ct_ps_df$Group <- paste(pcoa_ct_ps_df$Condition, pcoa_ct_ps_df$IntestinalSection, sep = "-")
+
+pcoa_ct_ps_plot <- ggplot(pcoa_ct_ps_df, aes(x = Axis1, y = Axis2, color = Group)) +
+  geom_point(size = 4) + 
+  labs(title = "PCoA - Conditions CT vs PS and Intestinal Sections", x = "PCoA Axis 1", y = "PCoA Axis 2") +
+  theme_light() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor = element_line(color = "gray90")
+  ) +
+  scale_color_manual(values = c("CT-FG" = "blue", "PS-FG" = "cyan", 
+                                "CT-MG" = "green", "PS-MG" = "grey", 
+                                "CT-HG" = "purple", "PS-HG" = "red"))
+
+ggsave("PCoA_CT_PS_ForeGut_MidGut_HindGut.png", plot = pcoa_ct_ps_plot, width = 12, height = 8, dpi = 300)
+
+# 12. Differential abundance analysis
+# Condition: CT vs PS
+sample_variables(phyloseq_obj)
+data_deseq2 <- phyloseq_to_deseq2(phyloseq_obj, ~ Condition)
+data_deseq2$Condition <- relevel(data_deseq2$Condition, ref = "CT")
+data_deseq2_an <- DESeq(data_deseq2, sfType = "poscounts")
+
+allres <- as.data.frame(results(data_deseq2_an))
+allres <- allres[order(allres$padj, na.last=NA), ]
+allres <- allres[!is.na(allres$padj), ]
+allres <- allres[allres$padj < 0.05, ]
+
+aggregatore <- merge(allres, tax_table(phyloseq_obj), by='row.names', all.x=TRUE)
+rownames(aggregatore) <- aggregatore$Row.names
+aggregatore$Row.names <- NULL
+
+num_genera <- length(unique(aggregatore$Genus))
+random_colors <- colorRampPalette(brewer.pal(9, "Set1"))(num_genera)
+plot <- ggplot(aggregatore, aes(x = Genus, y = log2FoldChange, fill= Genus)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(values = random_colors) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "Genus", y = "Log2 Fold Change", title = "Differential Abundance Analysis")
+
+output_file <- "C:/path/to/Guts_metabarcoding/differential_abundance_analysis_guts_CT_PS.png"
+ggsave(filename = output_file, plot = plot, width = 10, height = 6, dpi = 300)
+
+# Condition_IntestinalSection: CTFG, CTMG, CTHG, PSFG, PSMG, PSHG
+sample_data(phyloseq_obj)$Combined <- factor(paste(sample_data(phyloseq_obj)$Condition, sample_data(phyloseq_obj)$IntestinalSection, sep = ""))
+data_deseq2 <- phyloseq_to_deseq2(phyloseq_obj, ~ Combined)
+
+# Condition, IntestinalSection
+# Example contrast: PSFG vs CTFG
+sample_data(phyloseq_obj)$Combined <- factor(paste(sample_data(phyloseq_obj)$Condition, sample_data(phyloseq_obj)$IntestinalSection, sep = ""))
+data_deseq2 <- phyloseq_to_deseq2(phyloseq_obj, ~ Combined)
+data_deseq2$Combined <- relevel(data_deseq2$Combined, ref = "CTFG")
+
+data_deseq2_an <- DESeq(data_deseq2, sfType = "poscounts")
+
+allres <- as.data.frame(results(data_deseq2_an, contrast = c("Combined", "PSFG", "CTFG")))
+allres <- allres[order(allres$padj, na.last=NA), ]
+allres <- allres[!is.na(allres$padj), ]
+allres <- allres[allres$padj < 0.05, ]
+
+aggregatore <- merge(allres, tax_table(phyloseq_obj), by='row.names', all.x=TRUE)
+rownames(aggregatore) <- aggregatore$Row.names
+aggregatore$Row.names <- NULL
+
+random_colors <- colorRampPalette(brewer.pal(9, "Set1"))(length(unique(aggregatore$Genus)))
+plot <- ggplot(aggregatore, aes(x = Genus, y = log2FoldChange, fill= Genus)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(values = random_colors) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "Genus", y = "Log2 Fold Change", title = "Differential Abundance: PSFG vs CTFG")
+
+output_file <- "C:/path/to/Guts_metabarcoding/differential_abundance_analysis_PSFG_vs_CTFG.png"
+ggsave(filename = output_file, plot = plot, width = 28, height = 8, dpi = 300)
+
+
+# 13. # Venn diagram
+# CT condition
+phyloseq_control <- subset_samples(phyloseq_obj, Condition == "CT")
+otu_matrix_control <- as(otu_table(phyloseq_control), "matrix")
+
+otus_present_fg_control <- rownames(otu_matrix_control)[rowSums(otu_matrix_control[, grep("^FG", colnames(otu_matrix_control))]) > 0]
+otus_present_mg_control <- rownames(otu_matrix_control)[rowSums(otu_matrix_control[, grep("^MG", colnames(otu_matrix_control))]) > 0]
+otus_present_hg_control <- rownames(otu_matrix_control)[rowSums(otu_matrix_control[, grep("^HG", colnames(otu_matrix_control))]) > 0]
+
+identical(otus_present_fg_control, otus_present_mg_control)
+identical(otus_present_fg_control, otus_present_hg_control)
+identical(otus_present_mg_control, otus_present_hg_control)
+
+otus_shared_fg_mg_control <- intersect(otus_present_fg_control, otus_present_mg_control)
+otus_shared_fg_hg_control <- intersect(otus_present_fg_control, otus_present_hg_control)
+otus_shared_mg_hg_control <- intersect(otus_present_mg_control, otus_present_hg_control)
+
+venn_data_control <- list(
+  FG = otus_present_fg_control,
+  MG = otus_present_mg_control,
+  HG = otus_present_hg_control
+)
+
+venn_diagram_control <- venn.diagram(
+  x = venn_data_control,
+  category.names = c("Foregut CT", "Midgut CT", "Hindgut CT"),
+  filename = NULL,  
+  output = TRUE,
+  fill = c("#FFA500", "#FF7F50", "#FF4500"),
+  alpha = 0.5,
+  cex = 1,       
+  cat.cex = 0.8,   
+  cat.pos = c(-20, 20, 180), 
+  cat.dist = c(0.05, 0.05, 0.05), 
+  main = "Number of OTUs (Control) ",
+  cat.col = c("black", "black", "black")  
+)
+
+grid.draw(venn_diagram_control)
+
+# PS condition
+phyloseq_polystyrene <- subset_samples(phyloseq_obj, Condition == "PS")
+otu_matrix_polystyrene <- as(otu_table(phyloseq_polystyrene), "matrix")
+
+otus_present_fg_polystyrene <- rownames(otu_matrix_polystyrene)[rowSums(otu_matrix_polystyrene[, grep("^FG", colnames(otu_matrix_polystyrene))]) > 0]
+otus_present_mg_polystyrene <- rownames(otu_matrix_polystyrene)[rowSums(otu_matrix_polystyrene[, grep("^MG", colnames(otu_matrix_polystyrene))]) > 0]
+otus_present_hg_polystyrene <- rownames(otu_matrix_polystyrene)[rowSums(otu_matrix_polystyrene[, grep("^HG", colnames(otu_matrix_polystyrene))]) > 0]
+
+identical(otus_present_fg_polystyrene, otus_present_mg_polystyrene)
+identical(otus_present_fg_polystyrene, otus_present_hg_polystyrene)
+identical(otus_present_mg_polystyrene, otus_present_hg_polystyrene
+
+otus_shared_fg_mg_polystyrene <- intersect(otus_present_fg_polystyrene, otus_present_mg_polystyrene)
+otus_shared_fg_hg_polystyrene <- intersect(otus_present_fg_polystyrene, otus_present_hg_polystyrene)
+otus_shared_mg_hg_polystyrene <- intersect(otus_present_mg_polystyrene, otus_present_hg_polystyrene)
+
+venn_data_polystyrene <- list(
+  FG = otus_present_fg_polystyrene,
+  MG = otus_present_mg_polystyrene,
+  HG = otus_present_hg_polystyrene
+)
+
+venn_diagram_polystyrene <- venn.diagram(
+  x = venn_data_polystyrene,
+  category.names = c("Foregut PS", "Midgut PS", "Hindgut PS"),
+  filename = NULL,  
+  output = TRUE,
+  fill = c("#4CAF50", "#8BC34A", "#C5E1A5"),
+  alpha = 0.5,
+  cex = 1.2,       
+  cat.cex = 1.2,   
+  cat.pos = c(-30, 30, 0),
+  cat.dist = c(0.10, 0.10, 0.10),
+  main = "Number of OTUs (Polystyrene)",
+  cat.col = c("black", "black", "black")  
+)
+
+grid.draw(venn_diagram_polystyrene)
+
+
+# Heatmap of taxa abundance
+setwd("C:/path/to/Guts_metabarcoding")
+taxonomy=read.csv('combined_taxa_list.csv', sep=';')
+OTU = read.csv('combined_sequences.csv', sep=';')
+
+table_df = merge(taxonomy, OTU, by='Sequence')
+tax_cols <- intersect(
+  c("Sequence","Kingdom","Phylum","Class","Order","Family","Genus","Species"),
+  names(table_df)
+)
+sample_cols <- setdiff(names(table_df), tax_cols)
+table_df_subsetted <- table_df[, c("Genus", sample_cols)]
+
+data <- melt(
+  table_df_subsetted,
+  id.vars = "Genus",
+  variable.name = "Sample",
+  value.name = "Abundance",
+  na.rm = TRUE
+)
+
+data$Abundance <- data$Abundance + 0.01
+data$Abundance <- round(data$Abundance, 2)
+
+heatmap_plot <- ggplot(data, aes(y = Sample, x = Genus)) +
+  geom_tile(aes(fill = Abundance)) +
+  theme_bw() +
+  scale_fill_distiller(palette = "Spectral", trans = "log", direction = -1,
+                       labels = function(x) round(x, 0)) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x  = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic")
+  ) +
+  labs(
+    x = "Genus",
+    y = "Samples",
+    fill = "Abundance (log-scaled)"
+  )
+
+ggsave('Heatmap.pdf', width = 20, height = 10)
+
+
+
+
+
