@@ -3,7 +3,7 @@ This repository contains the R pipeline used to analyze 16S full-length (PacBio)
 Input files can be directy dowloaded from the BioprojectID (PRJNA1330245) and are considered as raw data.
 
 ### The main results are linked to the manuscript:
-"Chemical characterization and gut microbial response unveil polystyrene biodegradation in the lesser mealworm" (in review). This README will be updated with citation details upon acceptance.
+"Chemical characterization and gut microbial response unveil polystyrene biodegradation in the lesser mealworm" (in review).
 
 --- 
 
